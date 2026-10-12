@@ -641,9 +641,11 @@ class WSIProcessor:
         loader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers_dataloader,
+            num_workers=12,          # 从原来的 6 或 8 提高到 12 (唤醒多核并发解压)
+            prefetch_factor=3,        # 关键参数：让 CPU 提前在后台解压好下 3 个批次的图片
             shuffle=False,
-            pin_memory=True, # 加速 CPU 到 GPU 的传输
+            pin_memory=True,
+            persistent_workers=True,  # 保持 worker 进程常驻，避免每个 batch 重新创建进程的开销
             worker_init_fn=worker_init_fn
         )
 
