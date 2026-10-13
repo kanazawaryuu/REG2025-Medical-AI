@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.metrics import f1_score, average_precision_score
+from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
 from tqdm import tqdm
 import random
 from torch.utils.tensorboard import SummaryWriter
@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 import warnings # 记得在文件头部导入这个
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler # 【新增】混合精度训练
+from pathlib import Path
 
 # --- 1. 配置与超参数 ---
 SEED = 42
@@ -27,6 +28,11 @@ def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 # --- 2. ASL Loss (解决长尾多标签的核心) ---
 class AsymmetricLoss(nn.Module):
@@ -41,8 +47,8 @@ class AsymmetricLoss(nn.Module):
         # 强制转为 float32 计算，防止半精度下对数/指数溢出
         x = x.float()
         y = y.float()
-        
         x_sigmoid = torch.sigmoid(x)
+        # 为正例保留微小余量，防止 log(0) 导致反向传播梯度截断为 0
         xs_pos = x_sigmoid.clamp(min=self.eps, max=1.0 - self.eps)
         xs_neg = (1.0 - x_sigmoid).clamp(min=self.eps, max=1.0 - self.eps)
 
@@ -61,8 +67,6 @@ class AsymmetricLoss(nn.Module):
             one_sided_w = torch.pow(1.0 - pt, one_sided_gamma).detach()
             loss = loss * one_sided_w
 
-        # 【核心修正】采用 sum() 保持单样本总 Loss 在 0.5~1.2 之间
-        # 彻底对齐主任务与辅助任务 (0.5 * loss_aux) 的梯度量级，杜绝主任务被边缘化
         return -loss.sum()
 
 # --- 3. 模型定义 (MLP Head版) ---
@@ -150,15 +154,21 @@ class MultiBranchAttentionMIL(nn.Module):
         }
         return outputs, A, M
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % (2**32)
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
 # --- 4. Dataset ---
 class BreastDataset(Dataset):
     def __init__(self, df: pd.DataFrame, label_cols: list, backbone: str = 'virchow2', training: bool = True):
-        self.feature_col = f"{backbone}_feature_path"
+        # stage3 内部防御
+        clean_bb = backbone.lower().replace('-', '_')
+        if clean_bb == 'hoptimus1':
+            clean_bb = 'h_optimus_1'
+        self.feature_col = f"{clean_bb}_feature_path"
+
+        if self.feature_col not in df.columns:
+            raise KeyError(
+                f"❌ 未在数据表中找到骨干网络 '{backbone}' 对应的特征列 '{self.feature_col}'！"
+                f"当前可用特征列: {[c for c in df.columns if 'feature' in c]}"
+            )
+        
         # 过滤有效路径
         self.df = df[df[self.feature_col].notna()].reset_index(drop=True)
         self.label_cols = label_cols
@@ -176,29 +186,26 @@ class BreastDataset(Dataset):
         row = self.df.iloc[idx]
         feat_path = row[self.feature_col]
         
-        # 【加固】强制 .copy() 消除多进程非连续或只读内存映射冲突
         features = np.load(feat_path).astype(np.float32).copy()
         
         if self.training:
             num_patches = features.shape[0]
             
-            # 【精准微调】将具有高局灶风险的微乳头补入保护名单，其余大病灶长尾类保持 512 采样
+            # 【重要】高局灶风险病灶切片，严禁丢弃核心瓦片
             is_focal_risk = (
                 row.get('label_micro_invasive', 0) == 1 or 
                 row.get('label_fea', 0) == 1 or
                 row.get('label_micropapillary', 0) == 1
             )
 
-            # 1. 对 97.5% 的常规切片：执行论文推荐的 512 动态瓦片下采样 (Bag-level Dropout 正则化)
+            # 1. 常规切片执行 512 动态采样 (防显存暴增 + Bag Dropout 正则化)
             if not is_focal_risk and num_patches > 512:
                 indices = np.random.choice(num_patches, 512, replace=False)
                 indices.sort()
                 features = features[indices]
             elif is_focal_risk:
-                # 2. 对 2.5% 的微小病灶切片：保留 100% 完整瓦片，严禁丢弃
-                pass
+                pass # 微小病灶切片保留 100% 全量瓦片
             elif num_patches > 10:
-                # 图块原本就不足 512 的稀疏样本：做常规 80%~100% 轻微扰动
                 keep_ratio = np.random.uniform(0.8, 1.0)
                 target_num = int(num_patches * keep_ratio)
                 indices = np.random.choice(num_patches, target_num, replace=False)
@@ -207,16 +214,14 @@ class BreastDataset(Dataset):
 
             features = torch.from_numpy(features).float()
             
-            # 特征高斯扰动与缩放
+            # 特征微扰与缩放
             noise = torch.randn_like(features) * np.random.uniform(0.0, 0.01)
             features = (features + noise) * np.random.uniform(0.98, 1.02)
         else:
-            # 验证与测试集永远保留 100% 完整全景，保障评估确定性
             features = torch.from_numpy(features).float()
 
         labels = torch.from_numpy(row[self.label_cols].fillna(0).values.astype(np.float32)).float()
         
-        # 子任务标签构建 (带 pd.isna 安全防护)
         def _safe_int(val, default=-1):
             return default if pd.isna(val) else int(val)
 
@@ -239,19 +244,13 @@ class BreastDataset(Dataset):
         return features, labels, aux_targets
 
 def get_strategic_sampler(dataset):
-    """
-    平滑自适应多标签加权采样器：
-    避免长尾类别产生反向权重跳变，权重严格单调且安全截断在 [1.0, 15.0]
-    """
-    # 【防护】防止 CSV 中的隐式空值打乱权重计算
+    # 防护：空值赋 0 并转 float32，避免隐式空值导致除零或 NaN
     targets = dataset.df[dataset.label_cols].fillna(0).values.astype(np.float32)
     class_sample_count = targets.sum(axis=0)
     class_sample_count = np.maximum(class_sample_count, 1)
     
     total_samples = len(dataset)
-    # 平滑反比缩放：w = (total_samples / (count + 5)) ** 0.5
     weights_per_class = np.sqrt(total_samples / (class_sample_count + 5.0))
-    # 归一化并限制动态范围在 [1.0, 15.0] 之间
     weights_per_class = np.clip(weights_per_class / weights_per_class.min(), 1.0, 15.0)
     
     print("\n--- [采样器策略核查 (部分典型类别)] ---")
@@ -282,11 +281,11 @@ def train_one_epoch(model, loader, criterion_main, optimizer, device, label_cols
     criterion_aux_ce = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_aux_bce = nn.BCEWithLogitsLoss(reduction='none')
 
-    # 【修复】安全检测设备与 bfloat16
+    # 设备安全校验：优先在 3090 上开启 bfloat16，彻底杜绝 NaN
     is_cuda = torch.cuda.is_available() and "cuda" in str(device)
-    device_type = 'cuda' if is_cuda else 'cpu'
     has_bf16 = is_cuda and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if has_bf16 else torch.float16
+    device_type = 'cuda' if is_cuda else 'cpu'
 
     for features, labels, aux_targets in tqdm(loader, desc="Training", leave=False):
         features, labels = features.to(device), labels.to(device)
@@ -301,7 +300,7 @@ def train_one_epoch(model, loader, criterion_main, optimizer, device, label_cols
             outputs, _, _ = model(features)
             loss_main = criterion_main(outputs['main'], labels)
             
-            # NST 掩码 Loss
+            # NST 掩码 Loss (各有效子分支求平均，杜绝失衡)
             nst_losses = []
             if (nst_grades[:, 0] != -1).any(): nst_losses.append(criterion_aux_ce(outputs['nst_tubule'], nst_grades[:, 0]))
             if (nst_grades[:, 1] != -1).any(): nst_losses.append(criterion_aux_ce(outputs['nst_nuclear'], nst_grades[:, 1]))
@@ -315,11 +314,11 @@ def train_one_epoch(model, loader, criterion_main, optimizer, device, label_cols
             if (dcis_necrosis != -1).any(): dcis_losses.append(criterion_aux_ce(outputs['dcis_necrosis'], dcis_necrosis))
             if idx_dcis != -1 and labels[:, idx_dcis].sum() > 0:
                 raw_bce = criterion_aux_bce(outputs['dcis_types'], dcis_types)
-                dcis_losses.append(raw_bce.mean())
+                dcis_losses.append(raw_bce.mean()) # 3 个亚型求平均
             loss_dcis = torch.stack(dcis_losses).mean() if dcis_losses else torch.tensor(0.0, device=device)
 
-            # 【权重平衡】主任务与两个辅助任务损失同处 ~1.0 数量级
-            loss_total = loss_main + 0.5 * loss_nst + 0.5 * loss_dcis
+            # 辅助损失系数设为 0.25，保障主任务占绝对主导
+            loss_total = loss_main + 0.25 * (loss_nst + loss_dcis)
 
         # 梯度回传
         if scaler is not None and amp_dtype == torch.float16:
@@ -342,8 +341,8 @@ def train_one_epoch(model, loader, criterion_main, optimizer, device, label_cols
         tracker[k] /= max(len(loader), 1)
         
     return tracker
-
-
+    
+# --- 5. 训练与验证 (验证函数) ---
 def validate(model, loader, device, label_names, return_attention=False):
     model.eval()
     all_targets, all_probs = [], []
@@ -352,14 +351,14 @@ def validate(model, loader, device, label_names, return_attention=False):
     sub_task_targets = {'nst_n': [], 'nst_t': [], 'nst_m': [], 'nst_o': [], 'dcis_g': [], 'dcis_n': [], 'dcis_t': []}
     
     is_cuda = torch.cuda.is_available() and "cuda" in str(device)
+    amp_dtype = torch.bfloat16 if (is_cuda and torch.cuda.is_bf16_supported()) else torch.float16
     device_type = 'cuda' if is_cuda else 'cpu'
-    has_bf16 = is_cuda and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if has_bf16 else torch.float16
 
     with torch.no_grad():
         for features, labels, aux in loader:
             features, labels = features.to(device), labels.to(device)
             
+            # 开启混合精度评估，与训练精度对齐并节省显存
             with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=is_cuda):
                 outputs, A, _ = model(features)
             
@@ -371,7 +370,7 @@ def validate(model, loader, device, label_names, return_attention=False):
             if return_attention:
                 all_attentions.append(A.squeeze(0).cpu().numpy() if A.dim() == 3 else A.cpu().numpy())
             
-            # NST 子任务记录
+            # NST 子任务
             sub_task_preds['nst_t'].append(outputs['nst_tubule'].argmax(dim=1).cpu().numpy())
             sub_task_targets['nst_t'].append(aux['nst_grades'][:, 0].cpu().numpy())
             sub_task_preds['nst_n'].append(outputs['nst_nuclear'].argmax(dim=1).cpu().numpy())
@@ -381,7 +380,7 @@ def validate(model, loader, device, label_names, return_attention=False):
             sub_task_preds['nst_o'].append(outputs['nst_overall'].argmax(dim=1).cpu().numpy())
             sub_task_targets['nst_o'].append(aux['nst_grades'][:, 3].cpu().numpy())
 
-            # DCIS 子任务记录
+            # DCIS 子任务
             sub_task_preds['dcis_g'].append(outputs['dcis_grade'].argmax(dim=1).cpu().numpy())
             sub_task_targets['dcis_g'].append(aux['dcis_grade'].cpu().numpy())
             sub_task_preds['dcis_n'].append(outputs['dcis_necrosis'].argmax(dim=1).cpu().numpy())
@@ -394,7 +393,6 @@ def validate(model, loader, device, label_names, return_attention=False):
     all_targets = np.vstack(all_targets)
     all_probs = np.vstack(all_probs)
     
-    # 辅助函数: 计算 Masked F1
     def calc_masked_f1(preds, targs):
         preds = np.concatenate(preds)
         targs = np.concatenate(targs)
@@ -410,7 +408,6 @@ def validate(model, loader, device, label_names, return_attention=False):
         valid_pos_mask = (all_targets.sum(axis=0) > 0)
         if valid_pos_mask.sum() > 0:
             val_map = average_precision_score(all_targets[:, valid_pos_mask], all_probs[:, valid_pos_mask], average='macro')
-            val_map = float(np.nan_to_num(val_map, nan=0.0))
             val_preds = (all_probs[:, valid_pos_mask] > 0.5).astype(int)
             val_f1 = f1_score(all_targets[:, valid_pos_mask], val_preds, average='macro', zero_division=0)
         else:
@@ -446,17 +443,17 @@ def find_optimal_thresholds(targets, probs, label_names):
             best_thresholds.append(0.5)
             continue
 
-        # 将搜索下界拓展至 0.01，兼顾极罕见长尾类别的低置信度命中
-        for th in np.arange(0.01, 0.95, 0.02):
+        # 【优化】下界放宽至 0.02，步长缩细至 0.02，精确捕获长尾类的低概率激活
+        for th in np.arange(0.02, 0.95, 0.02):
             y_pred = (y_score > th).astype(int)
             score = f1_score(y_true, y_pred, zero_division=0)
             if score > best_f1:
                 best_f1 = score
                 best_th = th
         
-        # 若依然无法捕获正样本，设置保底安全阈值 0.20，而非盲目使用 0.50
+        # 若仍无法命中（模型输出全低于 0.02），针对罕见类赋予 0.15 的探索性安全阈值，而非 0.50
         if best_f1 == 0.0:
-            best_th = 0.20
+            best_th = 0.15
             
         best_thresholds.append(round(float(best_th), 4))
         print(f"Class {label_names[i]:<25}: Best Th={best_th:.2f}, F1={best_f1:.4f}")
@@ -466,7 +463,7 @@ def find_optimal_thresholds(targets, probs, label_names):
 # --- 6. 主程序 (修改版：自动运行 5 折) ---
 
 def run_fold(fold_idx, args, df, label_cols, n_classes):
-    print(f"\n{'='*20} 开始训练 Fold {fold_idx} [{'Virchow2' if args.backbone=='virchow2' else 'CONCH'}] {'='*20}")
+    print(f"\n{'='*20} 开始训练 Fold {fold_idx} [{args.backbone.upper()}] {'='*20}")
     
     ckpt_dir = os.path.join(args.save_dir, 'checkpoints')
     log_dir = os.path.join(args.save_dir, 'logs', f'fold{fold_idx}')
@@ -489,7 +486,6 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
     val_dataset = BreastDataset(val_df, label_cols, backbone=args.backbone, training=False)
     sampler = get_strategic_sampler(train_dataset)
     
-    # 【优化】开启 persistent_workers，避免每个 Epoch 重复销毁与重建进程
     use_persistent = args.num_workers > 0
     train_loader = DataLoader(
         train_dataset, batch_size=1, sampler=sampler, 
@@ -503,19 +499,24 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
     )
     
     # 动态匹配模型输入维度
-    input_dim = 1280 if args.backbone == 'virchow2' else 512
+    if args.backbone == 'virchow2':
+        input_dim = 1280
+    elif args.backbone == 'conch':
+        input_dim = 512
+    elif args.backbone in ['h_optimus_1', 'h-optimus-1', 'hoptimus1']:
+        input_dim = 1536
+    elif args.backbone == 'gigapath':       
+        input_dim = 1536
+    else:
+        raise ValueError(f"未知的 backbone: {args.backbone}")
     idx_nst = label_cols.index('label_invasive_nst') if 'label_invasive_nst' in label_cols else 0
     idx_dcis = label_cols.index('label_dcis') if 'label_dcis' in label_cols else 1
     model = MultiBranchAttentionMIL(n_classes=n_classes, input_dim=input_dim, idx_nst=idx_nst, idx_dcis=idx_dcis).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
-    
-    # 【修复】安全初始化 GradScaler
-    is_cuda = torch.cuda.is_available() and "cuda" in str(DEVICE)
-    has_bf16 = is_cuda and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if has_bf16 else torch.float16
-    scaler = GradScaler() if (is_cuda and not has_bf16) else None
+    has_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    scaler = GradScaler() if (torch.cuda.is_available() and not has_bf16) else None
     
     best_score = -1.0  # 确保第 1 轮必定保存有效 checkpoint
     best_epoch = -1
@@ -541,6 +542,11 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
         writer.add_scalar('Val/mAP', val_map, epoch)
         writer.add_scalar('Val/F1_Macro', val_f1, epoch)
 
+        # 记录关键子任务指标
+        writer.add_scalar('Val/F1_NST_Overall', sub_metrics['nst_overall'], epoch)
+        writer.add_scalar('Val/F1_NST_Nuclear', sub_metrics['nst_nuclear'], epoch)
+        writer.add_scalar('Val/F1_DCIS_Grade', sub_metrics['dcis_grade'], epoch)
+
         # 记录所有子任务到 TensorBoard
         writer.add_scalar('SubTask/NST_Overall', sub_metrics['nst_overall'], epoch)
         writer.add_scalar('SubTask/NST_Tubule', sub_metrics['nst_tubule'], epoch)
@@ -561,8 +567,7 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
         print(f"Total Loss: {train_loss:.4f} (Main:{loss_dict['loss_main']:.3f} NST:{loss_dict['loss_nst']:.3f} DCIS:{loss_dict['loss_dcis']:.3f})")
         print(f"Metrics   : mAP: {val_map:.4f} | F1: {val_f1:.4f} | Score: {current_score:.4f}")
         
-        # 3. 打印关键类别 F1
-        # 【扩充】将真正的 6 例稀有类 (lymphoma, fea) 纳入终端实时监控
+        # 3. 打印关键类别 F1 (完整监控长尾与罕见类)
         monitor_targets = [
             'label_invasive_nst', 'label_dcis', 'label_mucinous', 
             'label_micro_invasive', 'label_micropapillary', 'label_lymphoma', 'label_fea'
@@ -623,7 +628,7 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
     model_path = os.path.join(ckpt_dir, f'best_model_fold{fold_idx}.pth')
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     
-    # 【核心优化】单次遍历同时获取 targets, probs 与 attentions，彻底省去一次磁盘全扫描
+    # 单次遍历同时获取 targets, probs 与 attentions
     _, _, val_targets, val_probs, _, val_attentions = validate(
         model, val_loader, DEVICE, label_cols, return_attention=True
     )
@@ -636,17 +641,24 @@ def run_fold(fold_idx, args, df, label_cols, n_classes):
             f.write(f"{label_cols[idx]},{th:.4f}\n")
     print(f"阈值已保存至 {th_save_path}")
 
-    # 固化 OOF 预测结果与注意力权重 (将阈值直接封入字典，Stage 4 秒级直读)
-    oof_save_path = os.path.join(meta_dir, f'oof_predictions_fold{fold_idx}.pt')
-    valid_wsi_ids = list(val_dataset.df['wsi_id'].values) if 'wsi_id' in val_dataset.df.columns else [f"slide_{i}" for i in range(len(val_probs))]
-    
+    # 【修复】优先提取纯净的 stem 主键，杜绝带 .tiff 后缀污染热力图坐标查找
+    if 'wsi_id' in val_dataset.df.columns:
+        valid_wsi_ids = [Path(str(x)).stem for x in val_dataset.df['wsi_id'].values]
+    elif 'id' in val_dataset.df.columns:
+        valid_wsi_ids = [Path(str(x)).stem for x in val_dataset.df['id'].values]
+    else:
+        valid_wsi_ids = [f"slide_{i}" for i in range(len(val_probs))]
+
+    # 建立 ID 到 Attention 矩阵的字典映射: {slide_id: A_matrix}
     attention_dict = {wsi_id: att for wsi_id, att in zip(valid_wsi_ids, val_attentions)}
 
+    # 统一存为 .pt 文件，封装概率、真值、ID、阈值与注意力字典
+    oof_save_path = os.path.join(meta_dir, f'oof_predictions_fold{fold_idx}.pt')
     torch.save({
         'probs': val_probs,
         'targets': val_targets,
         'wsi_ids': valid_wsi_ids,
-        'thresholds': np.array(best_thresholds, dtype=np.float32), # 【新增】阈值直接闭环
+        'thresholds': np.array(best_thresholds, dtype=np.float32),
         'attentions': attention_dict
     }, oof_save_path)
     print(f"✅ OOF 预测、切片注意力字典与最佳阈值已保存至 {oof_save_path}")
@@ -661,6 +673,8 @@ def plot_history(history, save_path):
     绘制训练过程的静态曲线图 (Robust版)
     """
     epochs = range(1, len(history['loss']) + 1)
+    # print(f"DEBUG: Plotting history with {len(history['loss'])} epochs. Loss data: {history['loss'][:5]}...") # Debug log
+    
     plt.figure(figsize=(15, 10))
     
     # 1. Loss 曲线
@@ -722,8 +736,9 @@ def plot_history(history, save_path):
 def main():
     parser = argparse.ArgumentParser(description="Stage 3: Multi-Branch CLAM-MB Training")
     parser.add_argument('--csv_path', type=str, default='final_train_list_multilabel.csv')
-    parser.add_argument('--backbone', type=str, default='virchow2', choices=['virchow2', 'conch'],
-                        help="选择训练的基础模型特征: virchow2 或 conch")
+    parser.add_argument('--backbone', type=str, default='virchow2', 
+                        choices=['virchow2', 'conch', 'h_optimus_1', 'h-optimus-1', 'gigapath'],
+                        help="选择训练的基础模型特征")
     parser.add_argument('--fold', type=int, default=-1, help="指定运行单折 (0-4)，设为 -1 则自动顺序运行全部 5 折")
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--epochs', type=int, default=20)
@@ -736,7 +751,8 @@ def main():
 
     set_seed(SEED)
     df = pd.read_csv(args.csv_path)
-    df = df[df['fold'].astype(str) != 'test'].copy()
+    # 强制转为去除首尾空格的字符串后再过滤 'test'
+    df = df[df['fold'].astype(str).str.strip().str.lower() != 'test'].copy()
     df['fold'] = df['fold'].astype(int)
     
     label_cols = [c for c in df.columns if c.startswith('label_')]
@@ -748,6 +764,95 @@ def main():
         run_fold(fold, args, df, label_cols, n_classes)
         
     print(f"\n✅ 训练任务完成！权重与元数据已存至 {args.save_dir}")
+
+    # === 5折交叉验证整体结果汇总 (含默认阈值与最优阈值双指标) ===
+    if args.fold == -1:
+        print("\n" + "="*30 + " 5折交叉验证整体结果汇总 " + "="*30)
+        meta_dir = os.path.join(args.save_dir, 'metadata')
+        summary_records = []
+        all_oof_targets, all_oof_probs, all_oof_thresholds = [], [], []
+
+        for f_idx in range(5):
+            oof_path = os.path.join(meta_dir, f'oof_predictions_fold{f_idx}.pt')
+            if not os.path.exists(oof_path):
+                continue
+            data = torch.load(oof_path, map_location='cpu', weights_only=False)
+            targs, probs = data['targets'], data['probs']
+            ths = data.get('thresholds', np.full(targs.shape[1], 0.5))
+
+            if hasattr(targs, 'cpu'): targs = targs.cpu().numpy()
+            if hasattr(probs, 'cpu'): probs = probs.cpu().numpy()
+            if hasattr(ths, 'cpu'): ths = ths.cpu().numpy()
+
+            all_oof_targets.append(targs)
+            all_oof_probs.append(probs)
+            all_oof_thresholds.append(ths)
+
+            # 单折指标计算
+            valid_pos = targs.sum(axis=0) > 0
+            f_map = (
+                average_precision_score(
+                    targs[:, valid_pos], probs[:, valid_pos], average="macro"
+                )
+                if valid_pos.sum() > 0
+                else 0.0
+            )
+            f_map = float(np.nan_to_num(f_map, nan=0.0))
+            f_macro_f1_default = f1_score(targs, (probs > 0.5).astype(int), average='macro', zero_division=0)
+            f_macro_f1_opt = f1_score(targs, (probs > ths).astype(int), average='macro', zero_division=0)
+            
+            summary_records.append({
+                'Fold': f"Fold {f_idx}",
+                'mAP': round(float(f_map), 4),
+                'Macro_F1 (th=0.5)': round(float(f_macro_f1_default), 4),
+                'Macro_F1 (Opt_Th)': round(float(f_macro_f1_opt), 4)
+            })
+
+        if len(summary_records) > 0:
+            df_summary = pd.DataFrame(summary_records)
+            
+            # 全局 OOF 评价
+            global_targets = np.vstack(all_oof_targets)
+            global_probs = np.vstack(all_oof_probs)
+            mean_ths = np.mean(all_oof_thresholds, axis=0)
+            global_valid_pos = global_targets.sum(axis=0) > 0
+            global_map = (
+                average_precision_score(
+                    global_targets[:, global_valid_pos], global_probs[:, global_valid_pos], average="macro"
+                )
+                if global_valid_pos.sum() > 0
+                else 0.0
+            )
+            global_map = float(np.nan_to_num(global_map, nan=0.0))
+            global_f1_def = f1_score(global_targets, (global_probs > 0.5).astype(int), average='macro', zero_division=0)
+            global_f1_opt = f1_score(global_targets, (global_probs > mean_ths).astype(int), average='macro', zero_division=0)
+
+            # 打印与保存
+            print(df_summary.to_string(index=False))
+            print("-" * 65)
+            print(f"5-Fold Mean ± Std : mAP: {df_summary['mAP'].mean():.4f} ± {df_summary['mAP'].std():.4f} | "
+                  f"F1(Opt): {df_summary['Macro_F1 (Opt_Th)'].mean():.4f} ± {df_summary['Macro_F1 (Opt_Th)'].std():.4f}")
+            print(f"Global OOF (N={len(global_targets)}): mAP: {global_map:.4f} | F1(Opt): {global_f1_opt:.4f}")
+
+            # 将汇总指标直接追加到 DataFrame 并保存
+            df_export = pd.concat([
+                df_summary,
+                pd.DataFrame([{
+                    'Fold': 'Mean ± Std',
+                    'mAP': f"{df_summary['mAP'].mean():.4f} ± {df_summary['mAP'].std():.4f}",
+                    'Macro_F1 (th=0.5)': f"{df_summary['Macro_F1 (th=0.5)'].mean():.4f} ± {df_summary['Macro_F1 (th=0.5)'].std():.4f}",
+                    'Macro_F1 (Opt_Th)': f"{df_summary['Macro_F1 (Opt_Th)'].mean():.4f} ± {df_summary['Macro_F1 (Opt_Th)'].std():.4f}"
+                }, {
+                    'Fold': f'Global OOF (N={len(global_targets)})',
+                    'mAP': round(float(global_map), 4),
+                    'Macro_F1 (th=0.5)': round(float(global_f1_def), 4),
+                    'Macro_F1 (Opt_Th)': round(float(global_f1_opt), 4)
+                }])
+            ], ignore_index=True)
+
+            report_csv_path = os.path.join(args.save_dir, 'kfold_summary_report.csv')
+            df_export.to_csv(report_csv_path, index=False)
+            print(f"✅ 完整汇总报告已自动保存至: {report_csv_path}")
 
 if __name__ == "__main__":
     main()
