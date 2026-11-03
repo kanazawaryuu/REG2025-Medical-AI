@@ -144,6 +144,43 @@ class REG_Evaluator_Pro:
 
 # --- 3. 辅助函数 ---
 
+def detect_model_info(pred_path: str, tag: str = None) -> str:
+    """自动解析文件名或标签，智能判定评估模型类别 (单模 / 配对 / 三模 / 四模 / 最终集成)"""
+    name = (f"{Path(pred_path).stem} {tag or ''}").lower()
+    
+    # 1. 最终集成 / 冠军模型
+    if 'champion' in name or 'score' in name:
+        return "🏆 最终全局集成 (Score-based Champion Ensemble)"
+    if 'map' in name and 'ensemble' in name:
+        return "🎯 mAP 轨融合集成 (mAP-based Ensemble)"
+    
+    # 2. 单模型检测
+    if 'single' in name or ('virchow2' in name and not any(k in name for k in ['conch', 'hop', 'giga'])):
+        if 'virchow2' in name: return "🔬 单模型评估: Virchow2 (1280维)"
+        if 'conch' in name: return "🔬 单模型评估: CONCH 1.5 (1024维)"
+        if 'h_optimus' in name or 'hop1' in name: return "🔬 单模型评估: H-optimus-1 (1536维)"
+        if 'gigapath' in name or 'giga' in name: return "🔬 单模型评估: Prov-GigaPath (1536维)"
+        return "🔬 单模型评估"
+        
+    # 3. 统计组合模型数量
+    models = []
+    if 'conch' in name: models.append('CONCH1.5')
+    if 'virchow' in name: models.append('Virchow2')
+    if 'hop' in name or 'optimus' in name: models.append('H-optimus-1')
+    if 'giga' in name: models.append('GigaPath')
+    
+    cnt = len(models)
+    models_str = " + ".join(models) if models else "多模型组合"
+    
+    if cnt == 2 or 'pair' in name or '2m' in name:
+        return f"🤝 双模两两配对集成 (2-Model Ensemble): {models_str}"
+    elif cnt == 3 or '3m' in name:
+        return f"⚡ 三模配对集成 (3-Model Ensemble): {models_str}"
+    elif cnt == 4 or '4m' in name or 'all' in name:
+        return f"🌐 四模全量集成 (4-Model Ensemble): {models_str}"
+        
+    return f"📊 评估配置: {Path(pred_path).name}"
+
 def categorize_sample(text):
     """简单分类样本，用于分层分析"""
     text = text.lower()
@@ -260,6 +297,14 @@ def main():
 
     report_lines = []
     
+    # 【新增】报告顶部醒目点名模型与配对模式
+    model_type_banner = detect_model_info(args.pred, args.tag)
+    report_lines.append("=" * 65)
+    report_lines.append(f"【评估对象】: {model_type_banner}")
+    report_lines.append(f"【预测文件】: {Path(args.pred).name}")
+    report_lines.append(f"【实验标签】: {tag.upper()}")
+    report_lines.append("=" * 65)
+    report_lines.append("")
     report_lines.append(f"总样本数 (TOTAL SAMPLES): {total_samples}")
     report_lines.append(f"总体评分 (OVERALL RANKING SCORE): {overall_score:.4f}")
     report_lines.append("")

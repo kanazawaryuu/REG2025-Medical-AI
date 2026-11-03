@@ -209,7 +209,13 @@ def load_foundation_backbone(backbone_key: str):
     elif backbone_key == 'CONCH1.5':
         weights_path = "/home/zjin/weights/conch1_5/pytorch_model_vision.bin"
         if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"未找到 CONCH 1.5 权重文件: {weights_path}")
+            # 自动搜索本地 huggingface 缓存兜底
+            ckpt_path = Path("~/.cache/huggingface/hub/models--MahmoodLab--conchv1_5").expanduser()
+            bin_files = list(ckpt_path.glob("**/pytorch_model_vision.bin"))
+            if bin_files:
+                weights_path = str(bin_files[0])
+            else:
+                raise FileNotFoundError(f"未找到 CONCH 1.5 权重文件: {weights_path}")
 
         print(f"  ⚡ [本地直读] 正在加载 CONCH 1.5 官方真实纯视觉权重: {weights_path}")
         model = timm.create_model(
@@ -743,7 +749,8 @@ def main():
                 m_dir, ref_fp, d_feats, dim, len(label_cols), idx_nst, idx_dcis
             )
             if d_pct is not None:
-                dense_atts[m_name] = (d_pct, dense_c, 224 if m_name != 'GigaPath' else 448)
+                # 统一使用 224 物理瓦片尺度
+                dense_atts[m_name] = (d_pct, dense_c, 224)
                 ref_atts[m_name] = r_pct
                 model_probs[m_name] = prob_vec
                 print(f"  🎯 [{m_name:<11}] 完成 5 折 A_raw 基准分位数校准 (采样点: {d_pct.shape[1]})")

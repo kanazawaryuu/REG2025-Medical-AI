@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import os
 import sys
+import gc
 import glob
 import time
 import shutil
@@ -402,7 +403,7 @@ class WSIManager:
                 data = json.load(f)
             for item in data:
                 if 'id' in item and 'report' in item and item['report']:
-                    organ = item['report'].split(',')[0].strip()
+                    organ = item['report'].replace(';', ',').split('\n')[0].split(',')[0].strip().capitalize()
                     raw_id = str(item['id']).strip()
                     mapping[raw_id] = organ
                     # 同时匹配 stem，防止无后缀 ID 导致归入 Unknown
@@ -681,9 +682,21 @@ class WSIProcessor:
 
             # 3. 保存特征与状态 (原子操作，单线程无锁写入)
             self._save_results(basename, final_feats, final_tiles, w, h, region_size, orig_mpp, wsi_path, output_dir, is_corrupted=is_corrupted)
+
+            # 显式清理单张 WSI 处理后的内存与句柄
+            if 'slide' in locals() and hasattr(slide, 'close'):
+                try:
+                    slide.close()
+                except Exception:
+                    pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             elapsed = time.time() - start_time
-            logger.info(f"✅ 完成: {basename} | 形状: {final_feats.shape} | 扫描: {scan_time:.1f}s | 提取: {extract_time:.1f}s | 总计: {elapsed:.1f}s")
+            feat_shape = final_feats.shape
+            del final_feats, final_tiles
+            logger.info(f"✅ 完成: {basename} | 形状: {feat_shape} | 扫描: {scan_time:.1f}s | 提取: {extract_time:.1f}s | 总计: {elapsed:.1f}s")
             return True, 'completed'
 
         except Exception as e:
@@ -875,6 +888,12 @@ class WSIProcessor:
                         raise ValueError(f"不支持的模型: {self.config.model_name}")
                     
                 all_feats.append(feats.float().cpu().numpy()) # 转回 float32 保存
+
+        # 显式销毁 DataLoader 与 Dataset 释放多进程 worker 与持久句柄
+        del loader, dataset
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if not all_feats:
             return None

@@ -1,3 +1,11 @@
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+import pandas as pd
+try:
+    pd.set_option('future.no_silent_downcasting', True)
+except Exception:
+    pass
 import os
 import numpy as np
 import pandas as pd
@@ -85,16 +93,19 @@ class PredictionHead(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
+# --- 3. 模型定义 (纯视觉改进版: 29分支独立注意力解耦 + 跨头通信交互) ---
 class MultiBranchAttentionMIL(nn.Module):
     """
-    改进版 CLAM-MB 架构:
-    1. 22 个主类别独立注意力分支 (A_k)
-    2. NST 辅助任务绑定 NST 专属聚合特征 M_nst (index 0)
-    3. DCIS 辅助任务绑定 DCIS 专属聚合特征 M_dcis (index 1)
+    纯视觉改进版 CLAM-MB:
+    1. 【子类别专属注意力解耦】：扩建为 29 个独立注意力分支 (22 主类 + 7 个分级子任务独立探针)
+    2. 【破除分类头相互装瞎】：引入轻量级跨分支通信层 (Cross-Branch Attention)，让各病种与子任务在袋级互相感知
+    3. 【空间视点解耦】：7 个分级子任务使用专属微观特征，残差融合主病灶宏观上下文
     """
     def __init__(self, n_classes, input_dim=1280, hidden_dim=512, dropout=0.25, idx_nst=0, idx_dcis=1):
         super(MultiBranchAttentionMIL, self).__init__()
         self.n_classes = n_classes
+        self.n_subtasks = 7
+        self.total_branches = n_classes + self.n_subtasks  # 22 + 7 = 29
         self.idx_nst = idx_nst
         self.idx_dcis = idx_dcis
         
@@ -106,10 +117,15 @@ class MultiBranchAttentionMIL(nn.Module):
         self.attention_V = nn.Sequential(nn.Linear(hidden_dim, 256), nn.Tanh())
         self.attention_U = nn.Sequential(nn.Linear(hidden_dim, 256), nn.Sigmoid())
         
-        self.attention_weights = nn.Linear(256, n_classes)
+        # 【改进 1】将注意力分支扩建为 29 个独立探针 (22 主类 + 7 独立分级探针)
+        self.attention_weights = nn.Linear(256, self.total_branches)
         self.classifiers = nn.Linear(hidden_dim, n_classes)
         
-        # 辅助多任务头
+        # 【改进 2】纯视觉跨分支通信层：让 29 个分支在特征聚合后相互“打招呼”，不再各自孤立装瞎
+        self.cross_branch_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, dropout=dropout, batch_first=True)
+        self.norm_m = nn.LayerNorm(hidden_dim)
+        
+        # 辅助多任务头保持原版不变
         self.head_nst_tubule = PredictionHead(hidden_dim, 3)
         self.head_nst_nuclear = PredictionHead(hidden_dim, 3)
         self.head_nst_mitoses = PredictionHead(hidden_dim, 3)
@@ -121,39 +137,54 @@ class MultiBranchAttentionMIL(nn.Module):
 
     def forward(self, x):
         if x.dim() == 3:
-            x = x.squeeze(0) # [1, N, input_dim] -> [N, input_dim]
+            x = x.squeeze(0)  # [1, N, input_dim] -> [N, input_dim]
             
-        H = self.feature_extractor(x) # [N, hidden_dim]
+        H = self.feature_extractor(x)  # [N, hidden_dim]
         
-        # 门控注意力矩阵: [N, 256] -> [N, n_classes]
+        # 29 路独立门控注意力: [N, 256] -> [29, N]
         A = self.attention_weights(self.attention_V(H) * self.attention_U(H))
-        A = torch.transpose(A, 1, 0) # [n_classes, N]
-        A = F.softmax(A, dim=1)      # [n_classes, N]
+        A = torch.transpose(A, 1, 0)  # [29, N]
+        A = F.softmax(A, dim=1)       # [29, N]
         
-        # 类别特异性聚合: [n_classes, hidden_dim]
+        # 29 个分支各自池化专属特征: [29, hidden_dim]
         M = torch.mm(A, H)
         
-        # 主任务预测
-        logits_main = (M * self.classifiers.weight).sum(dim=1) + self.classifiers.bias
-        logits_main = logits_main.unsqueeze(0) # [1, n_classes]
+        # 【改进 2 生效】跨分支交互通信 (自注意力机制在 29 个分支间传递全局上下文信息)
+        M_seq = M.unsqueeze(0)  # [1, 29, hidden_dim]
+        M_inter, _ = self.cross_branch_attn(M_seq, M_seq, M_seq)
+        M = self.norm_m(M + M_inter.squeeze(0))  # [29, hidden_dim] 残差融合
         
-        # 【核心改进】类特异性特征解耦：
-        # NST 子任务直接使用 NST 注意力分支聚合特征；DCIS 子任务使用 DCIS 分支聚合特征
-        M_nst = M[self.idx_nst:self.idx_nst+1]   # [1, hidden_dim]
-        M_dcis = M[self.idx_dcis:self.idx_dcis+1] # [1, hidden_dim]
+        # 前 22 个分支用于主任务分类
+        M_main = M[:self.n_classes]  # [22, hidden_dim]
+        logits_main = (M_main * self.classifiers.weight).sum(dim=1) + self.classifiers.bias
+        logits_main = logits_main.unsqueeze(0)  # [1, n_classes]
+        
+        # 【改进 1 生效】后 7 个分支各自独立池化，并残差融入主病灶宏观背景
+        m_nst_base = M[self.idx_nst:self.idx_nst + 1]
+        m_dcis_base = M[self.idx_dcis:self.idx_dcis + 1]
+        
+        m_tubule  = m_nst_base + M[self.n_classes + 0:self.n_classes + 1]
+        m_nuclear = m_nst_base + M[self.n_classes + 1:self.n_classes + 2]
+        m_mitoses = m_nst_base + M[self.n_classes + 2:self.n_classes + 3]
+        m_overall = m_nst_base + M[self.n_classes + 3:self.n_classes + 4]
+        
+        m_d_grade = m_dcis_base + M[self.n_classes + 4:self.n_classes + 5]
+        m_d_necro = m_dcis_base + M[self.n_classes + 5:self.n_classes + 6]
+        m_d_types = m_dcis_base + M[self.n_classes + 6:self.n_classes + 7]
         
         outputs = {
             'main': logits_main,
-            'nst_tubule': self.head_nst_tubule(M_nst),
-            'nst_nuclear': self.head_nst_nuclear(M_nst),
-            'nst_mitoses': self.head_nst_mitoses(M_nst),
-            'nst_overall': self.head_nst_overall(M_nst),
-            'dcis_grade': self.head_dcis_grade(M_dcis),
-            'dcis_necrosis': self.head_dcis_necrosis(M_dcis),
-            'dcis_types': self.head_dcis_types(M_dcis)
+            'nst_tubule': self.head_nst_tubule(m_tubule),
+            'nst_nuclear': self.head_nst_nuclear(m_nuclear),
+            'nst_mitoses': self.head_nst_mitoses(m_mitoses),
+            'nst_overall': self.head_nst_overall(m_overall),
+            'dcis_grade': self.head_dcis_grade(m_d_grade),
+            'dcis_necrosis': self.head_dcis_necrosis(m_d_necro),
+            'dcis_types': self.head_dcis_types(m_d_types)
         }
-        return outputs, A, M
-
+        # 返回前 22 个主类注意力与特征，100% 保持下游 Stage 4 评估与 Stage 6 热力图的接口完全兼容
+        return outputs, A[:self.n_classes], M[:self.n_classes]
+        
 # --- 4. Dataset ---
 class BreastDataset(Dataset):
     def __init__(self, df: pd.DataFrame, label_cols: list, backbone: str = 'virchow2', training: bool = True):
@@ -798,7 +829,7 @@ def main():
     
     label_cols = [c for c in df.columns if c.startswith('label_')]
     n_classes = len(label_cols)
-    print(f"🚀 启动训练任务 [Backbone: {args.backbone.upper()}] | 检测到 {n_classes} 个主任务类别")
+    print(f"🚀 启动训练任务 [Backbone: {args.backbone.upper()}] | 主病种类别: {n_classes} 类 + 分级解耦子任务: 7 路 (模型内部已激活 29 独立分支与跨头交互)")
     
     folds_to_run = range(5) if args.fold == -1 else [args.fold]
     for fold in folds_to_run:
